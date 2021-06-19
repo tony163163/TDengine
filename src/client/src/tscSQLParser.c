@@ -2125,7 +2125,10 @@ void setResultColName(char* name, tSqlExprItem* pItem, int32_t functionId, SStrT
 }
 
 static void updateLastScanOrderIfNeeded(SQueryInfo* pQueryInfo) {
-  if (pQueryInfo->sessionWindow.gap > 0 || tscGroupbyColumn(pQueryInfo)) {
+  if (pQueryInfo->sessionWindow.gap > 0 ||
+      pQueryInfo->stateWindow ||
+      taosArrayGetSize(pQueryInfo->pUpstream) > 0 ||
+      tscGroupbyColumn(pQueryInfo)) {
     size_t numOfExpr = tscNumOfExprs(pQueryInfo);
     for (int32_t i = 0; i < numOfExpr; ++i) {
       SExprInfo* pExpr = tscExprGet(pQueryInfo, i);
@@ -2385,7 +2388,9 @@ int32_t addExprAndResultField(SSqlCmd* pCmd, SQueryInfo* pQueryInfo, int32_t col
 
       // NOTE: has time range condition or normal column filter condition, the last_row query will be transferred to last query
       SConvertFunc cvtFunc = {.originFuncId = functionId, .execFuncId = functionId};
-      if (functionId == TSDB_FUNC_LAST_ROW && ((!TSWINDOW_IS_EQUAL(pQueryInfo->window, TSWINDOW_INITIALIZER)) || (hasNormalColumnFilter(pQueryInfo)))) {
+      if (functionId == TSDB_FUNC_LAST_ROW && ((!TSWINDOW_IS_EQUAL(pQueryInfo->window, TSWINDOW_INITIALIZER)) ||
+                                               (hasNormalColumnFilter(pQueryInfo)) ||
+                                               taosArrayGetSize(pQueryInfo->pUpstream)>0)) {
         cvtFunc.execFuncId = TSDB_FUNC_LAST;
       }
 
@@ -4797,6 +4802,12 @@ int32_t validateWhereNode(SQueryInfo* pQueryInfo, tSqlExpr** pExpr, SSqlObj* pSq
   // 5. other column query condition
   if ((ret = getColumnQueryCondInfo(&pSql->cmd, pQueryInfo, condExpr.pColumnCond, TK_AND)) != TSDB_CODE_SUCCESS) {
     goto PARSE_WHERE_EXIT;
+  }
+
+  if (taosArrayGetSize(pQueryInfo->pUpstream) > 0 ) {
+    if ((ret = getColumnQueryCondInfo(&pSql->cmd, pQueryInfo, condExpr.pTimewindow, TK_AND)) != TSDB_CODE_SUCCESS) {
+      goto PARSE_WHERE_EXIT;
+    }
   }
 
   // 6. join condition
@@ -7775,6 +7786,11 @@ int32_t validateSqlNode(SSqlObj* pSql, SSqlNode* pSqlNode, SQueryInfo* pQueryInf
       }
     }
 
+    // parse the group by clause in the first place
+    if (validateGroupbyNode(pQueryInfo, pSqlNode->pGroupby, pCmd) != TSDB_CODE_SUCCESS) {
+      return TSDB_CODE_TSC_INVALID_OPERATION;
+    }
+
     if (validateSelectNodeList(pCmd, pQueryInfo, pSqlNode->pSelNodeList, false, false, false) != TSDB_CODE_SUCCESS) {
       return TSDB_CODE_TSC_INVALID_OPERATION;
     }
@@ -7804,11 +7820,6 @@ int32_t validateSqlNode(SSqlObj* pSql, SSqlNode* pSqlNode, SQueryInfo* pQueryInf
       if (validateWhereNode(pQueryInfo, &pSqlNode->pWhere, pSql) != TSDB_CODE_SUCCESS) {
         return TSDB_CODE_TSC_INVALID_OPERATION;
       }
-
-      if (pTableMeta->tableInfo.precision == TSDB_TIME_PRECISION_MILLI) {
-        pQueryInfo->window.skey = pQueryInfo->window.skey / 1000;
-        pQueryInfo->window.ekey = pQueryInfo->window.ekey / 1000;
-      }
     }
 
     // validate the interval info
@@ -7828,14 +7839,39 @@ int32_t validateSqlNode(SSqlObj* pSql, SSqlNode* pSqlNode, SQueryInfo* pQueryInf
       }
     }
 
+    int32_t joinQuery = 0;
+    int32_t timeWindowQuery =
+        (TPARSER_HAS_TOKEN(pSqlNode->interval.interval) || TPARSER_HAS_TOKEN(pSqlNode->sessionVal.gap));
+
+    // parse the window_state
+    if (validateStateWindowNode(pCmd, pQueryInfo, pSqlNode, false) != TSDB_CODE_SUCCESS) {
+      return TSDB_CODE_TSC_INVALID_OPERATION;
+    }
+
     // set order by info
     if (validateOrderbyNode(pCmd, pQueryInfo, pSqlNode, tscGetTableSchema(pTableMeta)) != TSDB_CODE_SUCCESS) {
+      return TSDB_CODE_TSC_INVALID_OPERATION;
+    }
+
+    // parse the having clause in the first place
+    if (validateHavingClause(pQueryInfo, pSqlNode->pHaving, pCmd, pSqlNode->pSelNodeList, joinQuery, timeWindowQuery) !=
+        TSDB_CODE_SUCCESS) {
+      return TSDB_CODE_TSC_INVALID_OPERATION;
+    }
+
+    /*
+     * transfer sql functions that need secondary merge into another format
+     * in dealing with super table queries such as: count/first/last
+     */
+    if (validateSessionNode(pCmd, pQueryInfo, pSqlNode) != TSDB_CODE_SUCCESS) {
       return TSDB_CODE_TSC_INVALID_OPERATION;
     }
 
     if ((code = doFunctionsCompatibleCheck(pCmd, pQueryInfo, tscGetErrorMsgPayload(pCmd))) != TSDB_CODE_SUCCESS) {
       return code;
     }
+
+    updateLastScanOrderIfNeeded(pQueryInfo);
   } else {
     pQueryInfo->command = TSDB_SQL_SELECT;
 
