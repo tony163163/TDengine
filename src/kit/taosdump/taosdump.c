@@ -1863,13 +1863,13 @@ int taosDumpTableData(FILE *fp, char *tbname, struct arguments *arguments, TAOS*
           converStringToReadable((char *)row[col], length[col], tbuf, COMMAND_SIZE);
           //pstr = stpcpy(pstr, tbuf);
           //*(pstr++) = '\'';
-          pstr += sprintf(pstr + curr_sqlstr_len, "\'%s\'", tbuf);
+          curr_sqlstr_len += sprintf(pstr + curr_sqlstr_len, "\'%s\'", tbuf);
           break;
         }
         case TSDB_DATA_TYPE_NCHAR: {
           char tbuf[COMMAND_SIZE] = {0};
           convertNCharToReadable((char *)row[col], length[col], tbuf, COMMAND_SIZE);
-          pstr += sprintf(pstr + curr_sqlstr_len, "\'%s\'", tbuf);
+          curr_sqlstr_len += sprintf(pstr + curr_sqlstr_len, "\'%s\'", tbuf);
           break;
         }
         case TSDB_DATA_TYPE_TIMESTAMP:
@@ -1909,6 +1909,8 @@ int taosDumpTableData(FILE *fp, char *tbname, struct arguments *arguments, TAOS*
       //fprintf(fp, "\\\n");
     //}
   }
+
+  printf("total_sqlstr_len: %d\n", total_sqlstr_len);
 
   fprintf(fp, "\n");
   atomic_add_fetch_64(&totalDumpOutRows, totalRows);
